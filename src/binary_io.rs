@@ -1,11 +1,10 @@
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use bitvec::prelude::BitVec;
+use bitvec::prelude::*;
 
 pub struct BinaryWriter {
     pub buf_writer: BufWriter<File>,
-    bit_buf: usize,
-    bits_written: u8,
+    bit_buf: BitVec<BigEndian, u8>
     bytes_written: usize
 }
 
@@ -23,8 +22,7 @@ impl BinaryWriter {
         dbg!(MAX_BIT_BUF_BYTES);
         BinaryWriter {
             buf_writer: BufWriter::new(f),
-            bit_buf: 0,
-            bits_written: 0,
+            bit_buf: BitVec::with_capacity(64);
             bytes_written: 0
         }
     }
@@ -34,6 +32,19 @@ impl BinaryWriter {
     }
 
     pub fn write_buf(&mut self) -> io::Result<()> {
+        // write bytes that are "ready", copy last "not ready" byte to new bit_buf
+
+        let bytes_ready = self.bit_buf.len() / 8;
+        if bytes_ready == 0 {return Ok(())}
+
+        // check if last byte is ready
+        if self.bit_buf.len() - (bytes_ready * 8) == 0 {
+            // can write all
+        }
+        else {
+            // need to save last byte
+        }
+
         let arr = self.bit_buf.to_be_bytes();
         /* unsafe {
             std::mem::transmute(self.bit_buf.to_be())
@@ -107,6 +118,9 @@ impl BinaryWriter {
     }
 
     pub fn write_path(&mut self, path: &BitVec) -> io::Result<()> {
+
+        // TODO instead of bitwise writing, write as much bytes as possible directly
+        // and only store the remaining bits in an buffer?
         for b in path {
             self.write_bit(b)?;
         }
