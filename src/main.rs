@@ -1,4 +1,5 @@
 #![feature(const_str_as_bytes)]
+#![feature(box_syntax)]
 
 use std::env;
 use std::io::{self};
@@ -90,5 +91,6 @@ impl Node {
     }
 }
 
-pub const MAX_BUF_SIZE : usize = 100_000;
+pub const MAX_BUF_SIZE : usize = 1024 * 64;
+pub const MAX_WORKERS : usize = 8;
 pub const HEADER : &[u8] = "HUFFMAN 0.1 Matthias Kind".as_bytes();

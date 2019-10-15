@@ -5,3 +5,4 @@ authors = ["lokmeinmatz <matze.kind@web.de>"]
 edition = "2018"
 
 [dependencies]
+bitvec = "0.15"

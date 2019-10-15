@@ -1,11 +1,18 @@
 use crate::binary_io::BinaryWriter;
 use crate::{Node, HEADER, MAX_BUF_SIZE};
+use bitvec::prelude::*;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicU16, Ordering},
+    mpsc::{channel, sync_channel, Receiver},
+    Arc, Mutex,
+};
+use std::thread::{self, JoinHandle};
 
-fn add_to_lookup(lookup: &mut HashMap<u8, Vec<bool>>, parent_path: Vec<bool>, node: &Node) {
+fn add_to_lookup(lookup: &mut HashMap<u8, BitVec>, parent_path: BitVec, node: &Node) {
     match node {
         Node::Branch(_, l1, l2) => {
             let mut l1_path = parent_path.clone();
@@ -42,25 +49,43 @@ fn write_tree(node: &Node, out: &mut BinaryWriter) -> io::Result<()> {
     Ok(())
 }
 
+struct PreData {
+    id: usize,
+    len: usize,
+    content: Box<[u8]>,
+}
+
+struct PostData {
+    id: usize,
+    content: BitVec,
+}
+
 pub fn encode(path: PathBuf) -> io::Result<()> {
     let mut file = std::fs::File::open(&path)?;
 
-
     struct Statistics {
         read_bytes: usize,
-        written_bytes: usize
+        written_bytes: usize,
     };
 
     let mut stats = Statistics {
         read_bytes: 0,
-        written_bytes: 0
+        written_bytes: 0,
     };
 
-    let mut buf: [u8; MAX_BUF_SIZE] = [0; MAX_BUF_SIZE];
+    // calculate how many threads are needed
+
+    let thread_count = std::cmp::min(
+        crate::MAX_WORKERS - 1,
+        file.metadata().expect("File metadata error").len() as usize / MAX_BUF_SIZE,
+    ) + 1;
+
+    println!("Worker threads used: {}", thread_count);
+
+    let mut r_buf: Vec<u8> = vec![0; MAX_BUF_SIZE];
     let mut counter: [usize; 256] = [0; 256];
 
-    while let Ok(bytes_read) = file.read(&mut buf) {
-
+    while let Ok(bytes_read) = file.read(&mut r_buf) {
         stats.read_bytes += bytes_read;
 
         if bytes_read == 0 {
@@ -68,12 +93,13 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
         }
 
         for i in 0..bytes_read {
-            let byte = buf[i];
+            let byte = r_buf[i];
 
             counter[byte as usize] += 1;
         }
     }
 
+    // the end byte
     counter[0x1c] = 1;
 
     // create boxed nodes
@@ -87,7 +113,6 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
         }
     }
 
-    // TODO: Add ending node to indecate that te file is ended to tree
     //       Maybe as u9 where last bit is only set if is end so the tree contains and end node
 
     while tree.len() > 1 {
@@ -119,15 +144,16 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
     }
 
     let root = tree.remove(0);
+    std::mem::drop(tree);
 
     if cfg!(debug_assertions) {
-        println!("{:#?}", root);
+        //println!("{:#?}", root);
     }
 
     // now create a lookup table
-    let mut lookup: HashMap<u8, Vec<bool>> = HashMap::new();
+    let mut lookup: HashMap<u8, BitVec> = HashMap::new();
 
-    add_to_lookup(&mut lookup, Vec::new(), &root);
+    add_to_lookup(&mut lookup, BitVec::new(), &root);
 
     println!("Created Lookup table, starting encoding...");
 
@@ -163,41 +189,164 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
     println!("Writing tree");
     write_tree(&root, &mut writer)?;
 
-    println!("Writing data");
-    while let Ok(bytes_read) = file.read(&mut buf) {
+    let mut workers: Vec<JoinHandle<()>> = Vec::with_capacity(thread_count);
+    let lookup = Arc::new(lookup);
+    let (pre_sender, pre_receiver) = sync_channel::<Option<PreData>>(4);
+    let (post_sender, post_receiver) = channel::<PostData>();
+    let workers_active = Arc::new(AtomicU16::new(0));
+    let postdata_waiting = Arc::new(AtomicU16::new(0));
+
+    let feed: Arc<Mutex<Receiver<Option<PreData>>>> = Arc::new(Mutex::new(pre_receiver));
+
+    for t_id in 0..thread_count {
+        let feed = feed.clone();
+        let lookup = lookup.clone();
+        let post_sender = post_sender.clone();
+        let workers_active = workers_active.clone();
+        let postdata_waiting = postdata_waiting.clone();
+
+        // tell worker "will" be active
+        workers_active.fetch_add(1, Ordering::Relaxed);
+
+        workers.push(thread::Builder::new().name(format!("worker_{}", t_id)).spawn(move || {
+            println!("thread {} waiting", t_id);
+            loop {
+
+                let data = {
+                    match feed.lock().expect("Feed Mutex poisoned").recv().unwrap() {
+                        Some(data) => data,
+                        None => break
+                    }
+                };
+
+                println!("[w{}] received {} bytes", t_id, data.len);
+                let mut compressed: BitVec<BigEndian, u8> = BitVec::with_capacity(64);
+
+                for i in 0..data.len {
+                    let byte = data.content[i];
+                    // get path to byte
+                    match lookup.get(&byte) {
+                        Some(path_vec) => compressed.extend(path_vec),
+                        None => {
+                            panic!("Byte not in lookup-table");
+                        }
+                    }
+                }
+
+                println!("[w{}] sends {} bits", t_id, compressed.len());
+                // send data to writer thread
+                postdata_waiting.fetch_add(1, Ordering::Relaxed);
+                post_sender.send(PostData {
+                    id: data.id,
+                    content: compressed
+                }).expect("Could not send PostData");
+            }
+            println!("[w{}] finished", t_id);
+            workers_active.fetch_sub(1, Ordering::Relaxed);
+        }).unwrap());
+    }
+
+    println!("Workers active: {}", workers_active.load(Ordering::Relaxed));
+
+    // writer thread
+    let writer_thread = thread::Builder::new().name("writer".to_owned()).spawn(move || {
+        println!("Writer-thread running");
+
+        let mut buf: Vec<PostData> = Vec::new();
+        let mut next_expected: usize = 0;
+
+        while workers_active.load(Ordering::Relaxed) > 0 || postdata_waiting.load(Ordering::Relaxed) > 0  {
+            let p_dat = post_receiver.recv().unwrap();
+            postdata_waiting.fetch_sub(1, Ordering::Relaxed);
+            println!("writer received {} bits", p_dat.content.len());
+            // case 1: p_dat ist next expected package
+            if p_dat.id == next_expected {
+                writer.write_path(&p_dat.content).unwrap();
+                next_expected += 1;
+
+                let mut n_idx = 0;
+
+                while n_idx < buf.len() && buf[n_idx].id == next_expected {
+                    writer.write_path(&p_dat.content).unwrap();
+                    next_expected += 1;
+                    n_idx += 1;
+                }
+
+                if n_idx > 0 {
+                    buf.drain(0..n_idx);
+                }
+            }
+
+            // case 2: p_dat is somewhere in buf
+            else if buf.len() > 0 && p_dat.id < buf.last().unwrap().id {
+                // find where to insert
+                let mut pos = 0;
+                while pos < buf.len() {
+                    if buf[pos].id > p_dat.id {
+                        break;
+                    }
+                    pos += 1;
+                }
+
+                buf.insert(pos, p_dat);
+            }
+            // case 3: p_dat is at the end
+            else {
+                buf.push(p_dat);
+            }
+        }
+
+        if buf.len() > 0 {
+            eprintln!("Still got {} unproccessed packages", buf.len());
+            eprintln!("First unprocessed id: {}", buf[0].id);
+            panic!("Not all packets processed");
+        }
+
+        // add finish byte
+        match lookup.get(&0x1c) {
+            Some(path_vec) => writer.write_path(path_vec).unwrap(),
+            None => {
+                panic!("FileSeperator Byte not in lookup-table");
+            }
+        }
+
+        stats.written_bytes = writer.get_bytes_written();
+
+        println!(
+            " --- Stats ---\nBytes read: {}\nBytes written: {}\nCompression rate: {}%\n",
+            stats.read_bytes,
+            stats.written_bytes,
+            (stats.read_bytes as f64 / stats.written_bytes as f64) * 100.0
+        );
+    }).unwrap();
+
+
+    let mut pre_id = 0;
+    while let Ok(bytes_read) = file.read(&mut r_buf) {
         if bytes_read == 0 {
             break;
         }
+        println!("Sending {} bytes for proceccing", bytes_read);
+        // fill queue
+        pre_sender.send(Some(PreData {
+            id: pre_id,
+            len: bytes_read,
+            content: r_buf.clone().into_boxed_slice()
+        })).expect("Sending PreData failed");
 
-        for i in 0..bytes_read {
-            let byte = buf[i];
-
-            // get path to byte
-            match lookup.get(&byte) {
-                Some(path_vec) => writer.write_path(path_vec)?,
-                None => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "Byte not in lookup-table",
-                    ))
-                }
-            }
-        }
+        pre_id += 1;
     }
 
-    match lookup.get(&0x1c) {
-        Some(path_vec) => writer.write_path(path_vec)?,
-        None => {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "FileSeperator Byte not in lookup-table",
-            ))
-        }
+    // terminate workers
+    for _ in &workers {
+        pre_sender.send(None).unwrap();
     }
 
-    stats.written_bytes = writer.get_bytes_written();
+    for t in workers {
+        t.join().unwrap();
+    }
 
-    println!(" --- Stats ---\nBytes read: {}\nBytes written: {}\nCompression rate: {}%\n", stats.read_bytes, stats.written_bytes, (stats.read_bytes as f64 / stats.written_bytes as f64) * 100.0);
+    writer_thread.join().unwrap();    
 
     Ok(())
 }

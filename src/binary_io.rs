@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
+use bitvec::prelude::BitVec;
 
 pub struct BinaryWriter {
     pub buf_writer: BufWriter<File>,
@@ -105,9 +106,9 @@ impl BinaryWriter {
         Ok(())
     }
 
-    pub fn write_path(&mut self, path: &Vec<bool>) -> io::Result<()> {
+    pub fn write_path(&mut self, path: &BitVec) -> io::Result<()> {
         for b in path {
-            self.write_bit(*b)?;
+            self.write_bit(b)?;
         }
         Ok(())
     }
