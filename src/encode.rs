@@ -18,7 +18,7 @@ fn add_to_lookup(lookup: &mut HashMap<u8, BitVec>, parent_path: BitVec, node: &N
             let mut l1_path = parent_path.clone();
             l1_path.push(false);
             add_to_lookup(lookup, l1_path, l1);
-            let mut l2_path = parent_path.clone();
+            let mut l2_path = parent_path;
             l2_path.push(true);
             add_to_lookup(lookup, l2_path, l2);
         }
@@ -92,10 +92,8 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
             break;
         }
 
-        for i in 0..bytes_read {
-            let byte = r_buf[i];
-
-            counter[byte as usize] += 1;
+        for byte in &r_buf {
+            counter[*byte as usize] += 1;
         }
     }
 
@@ -210,6 +208,9 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
 
         workers.push(thread::Builder::new().name(format!("worker_{}", t_id)).spawn(move || {
             println!("thread {} waiting", t_id);
+            let mut total_time_idle = 0f64;
+            let mut last_work_finished = std::time::Instant::now();
+
             loop {
 
                 let data = {
@@ -218,7 +219,7 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
                         None => break
                     }
                 };
-
+                total_time_idle += last_work_finished.elapsed().as_secs_f64();
                 println!("[w{}] received {} bytes", t_id, data.len);
                 let mut compressed: BitVec<BigEndian, u8> = BitVec::with_capacity(64);
 
@@ -240,8 +241,11 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
                     id: data.id,
                     content: compressed
                 }).expect("Could not send PostData");
+
+                last_work_finished = std::time::Instant::now();
             }
-            println!("[w{}] finished", t_id);
+            total_time_idle += last_work_finished.elapsed().as_secs_f64();
+            println!("[w{}] finished | idle time: {}", t_id, total_time_idle);
             workers_active.fetch_sub(1, Ordering::Relaxed);
         }).unwrap());
     }
@@ -278,7 +282,7 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
             }
 
             // case 2: p_dat is somewhere in buf
-            else if buf.len() > 0 && p_dat.id < buf.last().unwrap().id {
+            else if !buf.is_empty() && p_dat.id < buf.last().unwrap().id {
                 // find where to insert
                 let mut pos = 0;
                 while pos < buf.len() {
@@ -296,7 +300,7 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
             }
         }
 
-        if buf.len() > 0 {
+        if !buf.is_empty() {
             eprintln!("Still got {} unproccessed packages", buf.len());
             eprintln!("First unprocessed id: {}", buf[0].id);
             panic!("Not all packets processed");

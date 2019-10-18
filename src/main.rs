@@ -1,4 +1,3 @@
-#![feature(const_str_as_bytes)]
 #![feature(box_syntax)]
 
 use std::env;
@@ -24,7 +23,7 @@ fn main() -> io::Result<()> {
     let args : Vec<String> = env::args().skip(1).collect();
 
     let (mode, file_path) : (MainMode, String) = if let Some(e) = args.iter().find(|a| a == &"--encode" || a == &"-e") {
-        match args.iter().filter(|a| a != &e).next() {
+        match args.iter().find(|a| a != &e) {
             Some(path) => {(MainMode::Encoding, path.to_owned())},
             None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "No path specified"))
         }
@@ -32,7 +31,7 @@ fn main() -> io::Result<()> {
     } 
 
     else if let Some(e) = args.iter().find(|a| a == &"--decode" || a == &"-d") {
-        match args.iter().filter(|a| a != &e).next() {
+        match args.iter().find(|a| a != &e) {
             Some(path) => {(MainMode::Decoding, path.to_owned())},
             None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "No path specified"))
         }
@@ -85,12 +84,12 @@ pub enum Node {
 impl Node {
     pub fn count(&self) -> usize {
         match self {
-            Node::Branch(count, _, _) => return *count,
-            Node::Leaf(count, _) => return *count
+            Node::Branch(count, _, _) => *count,
+            Node::Leaf(count, _) => *count
         }
     }
 }
 
-pub const MAX_BUF_SIZE : usize = 1024 * 64;
-pub const MAX_WORKERS : usize = 8;
-pub const HEADER : &[u8] = "HUFFMAN 0.1 Matthias Kind".as_bytes();
+pub const MAX_BUF_SIZE : usize = 1024 * 128;
+pub const MAX_WORKERS : usize = 4;
+pub const HEADER : &[u8] = b"HUFFMAN 0.1 Matthias Kind";

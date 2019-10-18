@@ -2,9 +2,11 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use bitvec::prelude::*;
 
+const MAX_WRITER_BITCAP : usize = 512 * 8;
+
 pub struct BinaryWriter {
     pub buf_writer: BufWriter<File>,
-    bit_buf: BitVec<BigEndian, u8>
+    bit_buf: BitVec<BigEndian, u8>,
     bytes_written: usize
 }
 
@@ -22,7 +24,7 @@ impl BinaryWriter {
         dbg!(MAX_BIT_BUF_BYTES);
         BinaryWriter {
             buf_writer: BufWriter::new(f),
-            bit_buf: BitVec::with_capacity(64);
+            bit_buf: BitVec::with_capacity(MAX_WRITER_BITCAP),
             bytes_written: 0
         }
     }
@@ -38,51 +40,33 @@ impl BinaryWriter {
         if bytes_ready == 0 {return Ok(())}
 
         // check if last byte is ready
-        if self.bit_buf.len() - (bytes_ready * 8) == 0 {
+        let bits_rem = self.bit_buf.len() - (bytes_ready * 8);
+        if bits_rem == 0 {
+            let slice = self.bit_buf.as_slice();
             // can write all
+            self.buf_writer.write_all(&slice)?;
+            self.bit_buf.clear();
         }
         else {
             // need to save last byte
+            let slice = self.bit_buf.as_slice();
+            self.buf_writer.write_all(&slice[..(slice.len() - 1)])?;
+            self.bit_buf = BitVec::from_element(*slice.last().unwrap());
+            self.bit_buf.truncate(bits_rem);
+            self.bit_buf.reserve(MAX_WRITER_BITCAP - 1);
         }
 
-        let arr = self.bit_buf.to_be_bytes();
-        /* unsafe {
-            std::mem::transmute(self.bit_buf.to_be())
-        }; */
-        if cfg!(debug_assertions) && HIGH_DEBUG {
-            println!("write out: {:#066b} arr: {:x?}", self.bit_buf, arr);
-        }
-        self.buf_writer.write(&arr)?;
+        self.bytes_written += bytes_ready;
 
-        self.bytes_written += MAX_BIT_BUF_BYTES;
-
-        self.bits_written = 0;
-        self.bit_buf = 0;
         Ok(())
     }
 
     pub fn write_bit(&mut self, b: bool) -> io::Result<()> {
         // write bit
 
-        //before
-        if cfg!(debug_assertions) && HIGH_DEBUG {
-            println!("before bit: {:#066b}", self.bit_buf);
-        }
+        self.bit_buf.push(b);
 
-        if b {
-            self.bit_buf |= 1 << (MAX_BIT_BUF_BYTES as u8 * 8 - 1 - self.bits_written);
-            // 1 << (MAX_BIT_BUF_BYTES - 1) : last bit is 1
-        }
-
-        //after
-        if cfg!(debug_assertions) && HIGH_DEBUG {
-            println!("after bit:  {:#066b}", self.bit_buf);
-        }
-
-        self.bits_written += 1;
-
-        //println!("bit  {:#034b}", self.bit_buf);
-        if self.bits_written >= MAX_BIT_BUF_BYTES as u8 * 8 {
+        if self.bit_buf.len() > MAX_WRITER_BITCAP {
             self.write_buf()?;
         }
 
@@ -90,30 +74,11 @@ impl BinaryWriter {
     }
 
     pub fn write_byte(&mut self, b: u8) -> io::Result<()> {
-        let bits_for_buf = std::cmp::min(8, (MAX_BIT_BUF_BYTES as u8 * 8) - self.bits_written);
-        if cfg!(debug_assertions) && HIGH_DEBUG {
-            println!("bfb: {} buf: {:#066b}", bits_for_buf, self.bit_buf);
-        }
-        if bits_for_buf == 8 {
-            self.bit_buf |= (b as usize) << (MAX_BIT_BUF_BYTES as u8 * 8 - self.bits_written - 8);
-            self.bits_written += 8;
+        self.bit_buf.extend(b.as_bitslice::<BigEndian>());
 
-            if self.bits_written == MAX_BIT_BUF_BYTES as u8 * 8 {
-                self.write_buf()?;
-            }
-        } else {
-            //writes the bits that fit into buf
-            self.bit_buf |= (b as usize) >> (8 - bits_for_buf);
-
+        if self.bit_buf.len() > MAX_WRITER_BITCAP {
             self.write_buf()?;
-
-            // write remaining bits
-            let rem_bits = 8 - bits_for_buf;
-
-            self.bit_buf = (b as usize) << MAX_BIT_BUF_BYTES as u8 * 8 - rem_bits;
-            self.bits_written = rem_bits;
         }
-        //println!("byte {:#034b}", self.bit_buf);
         Ok(())
     }
 
@@ -121,8 +86,10 @@ impl BinaryWriter {
 
         // TODO instead of bitwise writing, write as much bytes as possible directly
         // and only store the remaining bits in an buffer?
-        for b in path {
-            self.write_bit(b)?;
+        self.bit_buf.extend(path);
+
+        if self.bit_buf.len() > MAX_WRITER_BITCAP {
+            self.write_buf()?;
         }
         Ok(())
     }
@@ -167,9 +134,9 @@ impl BinaryReader {
         }
         let res = Ok((self.bit_buf >> (MAX_BIT_BUF_BYTES * 8 - 1)) != 0);
 
-        self.bit_buf = self.bit_buf << 1;
+        self.bit_buf <<= 1;
         self.bits_read += 1;
-        return res;
+        res
     }
 
     pub fn read_byte(&mut self) -> io::Result<u8> {
@@ -180,24 +147,25 @@ impl BinaryReader {
             let res = Ok((self.bit_buf >> (MAX_BIT_BUF_BYTES * 8 - 8)) as u8);
             //println!("{:#034b}", self.bit_buf);
             self.bits_read += 8;
-            self.bit_buf = self.bit_buf << 8;
+            self.bit_buf <<= 8;
 
-            return res;
+            res
+
         } else {
             // problem: part of this byte is stored in next chunk
             let remaining = 8 - (MAX_BIT_BUF_BYTES as u8 * 8 - self.bits_read);
 
             assert!(remaining <= 8);
 
-            let mut res = (self.bit_buf >> MAX_BIT_BUF_BYTES * 8 - 8) as u8; // stores the high bits at the right place;
+            let mut res = (self.bit_buf >> (MAX_BIT_BUF_BYTES * 8 - 8)) as u8; // stores the high bits at the right place;
             self.read_buf()?;
 
             res |= (self.bit_buf >> (MAX_BIT_BUF_BYTES as u8 * 8 - remaining)) as u8;
 
-            self.bit_buf = self.bit_buf << remaining;
+            self.bit_buf <<= remaining;
             self.bits_read += remaining;
 
-            return Ok(res);
+            Ok(res)
         }
     }
 }
@@ -205,16 +173,9 @@ impl BinaryReader {
 impl Drop for BinaryWriter {
     fn drop(&mut self) {
         println!("Writing remaining bits...");
-        let mut x = self.bit_buf;
-        let mut rem_bits: Vec<u8> = Vec::with_capacity(self.bits_written as usize / 8);
-        while self.bits_written > 0 {
-            rem_bits.push((x >> (MAX_BIT_BUF_BYTES * 8 - 8)) as u8); // take the left most byte and push
-            x = x << 8; // move bytes to left 1 byte
-            self.bits_written = self.bits_written.saturating_sub(8);
-            self.bytes_written += 1;
-        }
+        
 
-        self.buf_writer.write(&rem_bits).unwrap();
+        self.write_buf().unwrap();
     }
 }
 
