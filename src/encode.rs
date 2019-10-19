@@ -18,7 +18,7 @@ fn add_to_lookup(lookup: &mut HashMap<u8, BitVec>, parent_path: BitVec, node: &N
             let mut l1_path = parent_path.clone();
             l1_path.push(false);
             add_to_lookup(lookup, l1_path, l1);
-            let mut l2_path = parent_path.clone();
+            let mut l2_path = parent_path;
             l2_path.push(true);
             add_to_lookup(lookup, l2_path, l2);
         }
@@ -30,7 +30,7 @@ fn add_to_lookup(lookup: &mut HashMap<u8, BitVec>, parent_path: BitVec, node: &N
 
 /// Writes Leaves as 1 bit followed by byte of the value
 /// Branch starts with 0 bit followed by left and right node
-fn write_tree(node: &Node, out: &mut BinaryWriter) -> io::Result<()> {
+fn write_tree(node: &Node, out: &mut BinaryWriter<std::fs::File>) -> io::Result<()> {
     match node {
         Node::Leaf(_, b) => {
             out.write_bit(true)?;
@@ -92,10 +92,8 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
             break;
         }
 
-        for i in 0..bytes_read {
-            let byte = r_buf[i];
-
-            counter[byte as usize] += 1;
+        for byte in &r_buf {
+            counter[*byte as usize] += 1;
         }
     }
 
@@ -113,16 +111,18 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
         }
     }
 
-    //       Maybe as u9 where last bit is only set if is end so the tree contains and end node
+    while tree.len() >= 2 {
+        // first elmt: lowest, second: second lowest
+        let mut lowest_two = if tree[0].count() < tree[1].count() { (0usize, 1usize) } else { (1usize, 0usize) };
 
-    while tree.len() > 1 {
-        let mut lowest_two = (1usize, 0usize);
-        for i in 0..tree.len() {
+        for i in 2..tree.len() {
             let count = tree[i].count();
-            if count < tree[lowest_two.1].count() {
+            if count < tree[lowest_two.0].count() {
+                // i gets new lowest, lowest_two.0 gets second lowest
+                lowest_two = (i, lowest_two.0);
+            } else if count < tree[lowest_two.1].count() {
+                // i is new second lowest
                 lowest_two = (lowest_two.0, i);
-            } else if count < tree[lowest_two.0].count() && lowest_two.1 != i {
-                lowest_two = (i, lowest_two.1);
             }
         }
 
@@ -155,6 +155,7 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
 
     add_to_lookup(&mut lookup, BitVec::new(), &root);
 
+
     println!("Created Lookup table, starting encoding...");
 
     file = std::fs::File::open(&path)?;
@@ -178,7 +179,7 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
     // write header
     println!("Writing header");
     writer
-        .buf_writer
+        .writer
         .write(HEADER)
         .map_err(|_e| io::Error::new(io::ErrorKind::Other, "Error while writing header"))?;
 
@@ -191,7 +192,7 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
 
     let mut workers: Vec<JoinHandle<()>> = Vec::with_capacity(thread_count);
     let lookup = Arc::new(lookup);
-    let (pre_sender, pre_receiver) = sync_channel::<Option<PreData>>(4);
+    let (pre_sender, pre_receiver) = sync_channel::<Option<PreData>>(10);
     let (post_sender, post_receiver) = channel::<PostData>();
     let workers_active = Arc::new(AtomicU16::new(0));
     let postdata_waiting = Arc::new(AtomicU16::new(0));
@@ -210,6 +211,9 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
 
         workers.push(thread::Builder::new().name(format!("worker_{}", t_id)).spawn(move || {
             println!("thread {} waiting", t_id);
+            let mut total_time_working = 0u64;
+            let mut bytes_processed = 0u64;
+
             loop {
 
                 let data = {
@@ -218,14 +222,14 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
                         None => break
                     }
                 };
-
-                println!("[w{}] received {} bytes", t_id, data.len);
-                let mut compressed: BitVec<BigEndian, u8> = BitVec::with_capacity(64);
+                bytes_processed += data.len as u64;
+                let start_time = std::time::Instant::now();
+                //println!("[w{}] received {} bytes", t_id, data.len);
+                let mut compressed: BitVec<BigEndian, u8> = BitVec::with_capacity(MAX_BUF_SIZE);
 
                 for i in 0..data.len {
-                    let byte = data.content[i];
                     // get path to byte
-                    match lookup.get(&byte) {
+                    match lookup.get(&data.content[i]) {
                         Some(path_vec) => compressed.extend(path_vec),
                         None => {
                             panic!("Byte not in lookup-table");
@@ -233,15 +237,18 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
                     }
                 }
 
-                println!("[w{}] sends {} bits", t_id, compressed.len());
+                //println!("[w{}] sends {} bits", t_id, compressed.len());
                 // send data to writer thread
                 postdata_waiting.fetch_add(1, Ordering::Relaxed);
                 post_sender.send(PostData {
                     id: data.id,
                     content: compressed
                 }).expect("Could not send PostData");
+
+                
+                total_time_working += start_time.elapsed().as_nanos() as u64;
             }
-            println!("[w{}] finished", t_id);
+            println!("[w{}] finished | avg time per byte: {}ns", t_id, total_time_working / bytes_processed );
             workers_active.fetch_sub(1, Ordering::Relaxed);
         }).unwrap());
     }
@@ -258,7 +265,7 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
         while workers_active.load(Ordering::Relaxed) > 0 || postdata_waiting.load(Ordering::Relaxed) > 0  {
             let p_dat = post_receiver.recv().unwrap();
             postdata_waiting.fetch_sub(1, Ordering::Relaxed);
-            println!("writer received {} bits", p_dat.content.len());
+            //println!("writer received {} bits", p_dat.content.len());
             // case 1: p_dat ist next expected package
             if p_dat.id == next_expected {
                 writer.write_path(&p_dat.content).unwrap();
@@ -278,7 +285,7 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
             }
 
             // case 2: p_dat is somewhere in buf
-            else if buf.len() > 0 && p_dat.id < buf.last().unwrap().id {
+            else if !buf.is_empty() && p_dat.id < buf.last().unwrap().id {
                 // find where to insert
                 let mut pos = 0;
                 while pos < buf.len() {
@@ -296,7 +303,7 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
             }
         }
 
-        if buf.len() > 0 {
+        if !buf.is_empty() {
             eprintln!("Still got {} unproccessed packages", buf.len());
             eprintln!("First unprocessed id: {}", buf[0].id);
             panic!("Not all packets processed");
@@ -326,7 +333,7 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
         if bytes_read == 0 {
             break;
         }
-        println!("Sending {} bytes for proceccing", bytes_read);
+        //println!("Sending {} bytes for proceccing", bytes_read);
         // fill queue
         pre_sender.send(Some(PreData {
             id: pre_id,
@@ -345,8 +352,11 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
     for t in workers {
         t.join().unwrap();
     }
+    let workers_finished = std::time::Instant::now();
 
     writer_thread.join().unwrap();    
+
+    println!("Writer thread continued for {}s", workers_finished.elapsed().as_secs_f64());
 
     Ok(())
 }
