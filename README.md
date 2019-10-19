@@ -23,3 +23,7 @@ You can also override the auto-detection (which is based on the file ending) by 
 ### Bitwise Read/Write
 For bitwise reading and writing there are Wrappers around the BufWriter/BufReader in binary_io.rs
 They read one usize a time and buffer it themself, and read the next if not enough bits are remaining.
+
+## TODO for the future
+- speed up the writing process (now takes about 60% just to finish the writing process)
+- parallize the decoder
