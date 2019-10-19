@@ -30,7 +30,7 @@ fn add_to_lookup(lookup: &mut HashMap<u8, BitVec>, parent_path: BitVec, node: &N
 
 /// Writes Leaves as 1 bit followed by byte of the value
 /// Branch starts with 0 bit followed by left and right node
-fn write_tree(node: &Node, out: &mut BinaryWriter) -> io::Result<()> {
+fn write_tree(node: &Node, out: &mut BinaryWriter<std::fs::File>) -> io::Result<()> {
     match node {
         Node::Leaf(_, b) => {
             out.write_bit(true)?;
@@ -111,16 +111,18 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
         }
     }
 
-    //       Maybe as u9 where last bit is only set if is end so the tree contains and end node
+    while tree.len() >= 2 {
+        // first elmt: lowest, second: second lowest
+        let mut lowest_two = if tree[0].count() < tree[1].count() { (0usize, 1usize) } else { (1usize, 0usize) };
 
-    while tree.len() > 1 {
-        let mut lowest_two = (1usize, 0usize);
-        for i in 0..tree.len() {
+        for i in 2..tree.len() {
             let count = tree[i].count();
-            if count < tree[lowest_two.1].count() {
+            if count < tree[lowest_two.0].count() {
+                // i gets new lowest, lowest_two.0 gets second lowest
+                lowest_two = (i, lowest_two.0);
+            } else if count < tree[lowest_two.1].count() {
+                // i is new second lowest
                 lowest_two = (lowest_two.0, i);
-            } else if count < tree[lowest_two.0].count() && lowest_two.1 != i {
-                lowest_two = (i, lowest_two.1);
             }
         }
 
@@ -153,6 +155,7 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
 
     add_to_lookup(&mut lookup, BitVec::new(), &root);
 
+
     println!("Created Lookup table, starting encoding...");
 
     file = std::fs::File::open(&path)?;
@@ -176,7 +179,7 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
     // write header
     println!("Writing header");
     writer
-        .buf_writer
+        .writer
         .write(HEADER)
         .map_err(|_e| io::Error::new(io::ErrorKind::Other, "Error while writing header"))?;
 
@@ -189,7 +192,7 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
 
     let mut workers: Vec<JoinHandle<()>> = Vec::with_capacity(thread_count);
     let lookup = Arc::new(lookup);
-    let (pre_sender, pre_receiver) = sync_channel::<Option<PreData>>(4);
+    let (pre_sender, pre_receiver) = sync_channel::<Option<PreData>>(10);
     let (post_sender, post_receiver) = channel::<PostData>();
     let workers_active = Arc::new(AtomicU16::new(0));
     let postdata_waiting = Arc::new(AtomicU16::new(0));
@@ -208,8 +211,8 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
 
         workers.push(thread::Builder::new().name(format!("worker_{}", t_id)).spawn(move || {
             println!("thread {} waiting", t_id);
-            let mut total_time_idle = 0f64;
-            let mut last_work_finished = std::time::Instant::now();
+            let mut total_time_working = 0u64;
+            let mut bytes_processed = 0u64;
 
             loop {
 
@@ -219,14 +222,14 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
                         None => break
                     }
                 };
-                total_time_idle += last_work_finished.elapsed().as_secs_f64();
-                println!("[w{}] received {} bytes", t_id, data.len);
-                let mut compressed: BitVec<BigEndian, u8> = BitVec::with_capacity(64);
+                bytes_processed += data.len as u64;
+                let start_time = std::time::Instant::now();
+                //println!("[w{}] received {} bytes", t_id, data.len);
+                let mut compressed: BitVec<BigEndian, u8> = BitVec::with_capacity(MAX_BUF_SIZE);
 
                 for i in 0..data.len {
-                    let byte = data.content[i];
                     // get path to byte
-                    match lookup.get(&byte) {
+                    match lookup.get(&data.content[i]) {
                         Some(path_vec) => compressed.extend(path_vec),
                         None => {
                             panic!("Byte not in lookup-table");
@@ -234,7 +237,7 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
                     }
                 }
 
-                println!("[w{}] sends {} bits", t_id, compressed.len());
+                //println!("[w{}] sends {} bits", t_id, compressed.len());
                 // send data to writer thread
                 postdata_waiting.fetch_add(1, Ordering::Relaxed);
                 post_sender.send(PostData {
@@ -242,10 +245,10 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
                     content: compressed
                 }).expect("Could not send PostData");
 
-                last_work_finished = std::time::Instant::now();
+                
+                total_time_working += start_time.elapsed().as_nanos() as u64;
             }
-            total_time_idle += last_work_finished.elapsed().as_secs_f64();
-            println!("[w{}] finished | idle time: {}", t_id, total_time_idle);
+            println!("[w{}] finished | avg time per byte: {}ns", t_id, total_time_working / bytes_processed );
             workers_active.fetch_sub(1, Ordering::Relaxed);
         }).unwrap());
     }
@@ -262,7 +265,7 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
         while workers_active.load(Ordering::Relaxed) > 0 || postdata_waiting.load(Ordering::Relaxed) > 0  {
             let p_dat = post_receiver.recv().unwrap();
             postdata_waiting.fetch_sub(1, Ordering::Relaxed);
-            println!("writer received {} bits", p_dat.content.len());
+            //println!("writer received {} bits", p_dat.content.len());
             // case 1: p_dat ist next expected package
             if p_dat.id == next_expected {
                 writer.write_path(&p_dat.content).unwrap();
@@ -330,7 +333,7 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
         if bytes_read == 0 {
             break;
         }
-        println!("Sending {} bytes for proceccing", bytes_read);
+        //println!("Sending {} bytes for proceccing", bytes_read);
         // fill queue
         pre_sender.send(Some(PreData {
             id: pre_id,
@@ -349,8 +352,11 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
     for t in workers {
         t.join().unwrap();
     }
+    let workers_finished = std::time::Instant::now();
 
     writer_thread.join().unwrap();    
+
+    println!("Writer thread continued for {}s", workers_finished.elapsed().as_secs_f64());
 
     Ok(())
 }

@@ -1,11 +1,11 @@
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use bitvec::prelude::*;
 
 const MAX_WRITER_BITCAP : usize = 512 * 8;
 
-pub struct BinaryWriter {
-    pub buf_writer: BufWriter<File>,
+pub struct BinaryWriter<T : Write> {
+    pub writer: T,
     bit_buf: BitVec<BigEndian, u8>,
     bytes_written: usize
 }
@@ -19,11 +19,11 @@ pub struct BinaryReader {
 const MAX_BIT_BUF_BYTES: usize = std::mem::size_of::<usize>();
 const HIGH_DEBUG: bool = false;
 
-impl BinaryWriter {
-    pub fn new(f: File) -> Self {
+impl<T : Write> BinaryWriter<T> {
+    pub fn new(w: T) -> Self {
         dbg!(MAX_BIT_BUF_BYTES);
         BinaryWriter {
-            buf_writer: BufWriter::new(f),
+            writer: w,
             bit_buf: BitVec::with_capacity(MAX_WRITER_BITCAP),
             bytes_written: 0
         }
@@ -44,13 +44,13 @@ impl BinaryWriter {
         if bits_rem == 0 {
             let slice = self.bit_buf.as_slice();
             // can write all
-            self.buf_writer.write_all(&slice)?;
+            self.writer.write_all(&slice)?;
             self.bit_buf.clear();
         }
         else {
             // need to save last byte
             let slice = self.bit_buf.as_slice();
-            self.buf_writer.write_all(&slice[..(slice.len() - 1)])?;
+            self.writer.write_all(&slice[..(slice.len() - 1)])?;
             self.bit_buf = BitVec::from_element(*slice.last().unwrap());
             self.bit_buf.truncate(bits_rem);
             self.bit_buf.reserve(MAX_WRITER_BITCAP - 1);
@@ -82,7 +82,7 @@ impl BinaryWriter {
         Ok(())
     }
 
-    pub fn write_path(&mut self, path: &BitVec) -> io::Result<()> {
+    pub fn write_path(&mut self, path: &BitSlice) -> io::Result<()> {
 
         // TODO instead of bitwise writing, write as much bytes as possible directly
         // and only store the remaining bits in an buffer?
@@ -170,19 +170,20 @@ impl BinaryReader {
     }
 }
 
-impl Drop for BinaryWriter {
+impl<T : Write> Drop for BinaryWriter<T> {
     fn drop(&mut self) {
         println!("Writing remaining bits...");
         
 
         self.write_buf().unwrap();
+        self.writer.flush().unwrap();
     }
 }
 
 #[test]
 fn binary_io_test() -> Result<(), io::Error> {
     {
-        let mut writer: BinaryWriter = BinaryWriter::new(std::fs::File::create("./test.bin")?);
+        let mut writer: BinaryWriter<std::fs::File> = BinaryWriter::new(std::fs::File::create("./test.bin")?);
         writer.write_bit(true)?;
         for i in 1..10 {
             writer.write_byte(i)?;

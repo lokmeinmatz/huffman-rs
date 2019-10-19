@@ -91,5 +91,5 @@ impl Node {
 }
 
 pub const MAX_BUF_SIZE : usize = 1024 * 128;
-pub const MAX_WORKERS : usize = 4;
+pub const MAX_WORKERS : usize = 8;
 pub const HEADER : &[u8] = b"HUFFMAN 0.1 Matthias Kind";
