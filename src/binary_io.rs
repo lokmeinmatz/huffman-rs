@@ -1,6 +1,7 @@
 use bitvec::prelude::*;
 use std::io::{self, Read, Write};
 
+
 const MAX_WRITER_BITCAP: usize = 512 * 8;
 const MAX_READER_BITCAP: usize = 128;
 
@@ -22,6 +23,11 @@ impl<T: Write> BinaryWriter<T> {
             bit_buf: BitVec::with_capacity(MAX_WRITER_BITCAP),
             bytes_written: 0,
         }
+    }
+
+    pub fn inner(mut self) -> T {
+        self.finish();
+        self.writer
     }
 
     pub fn get_bytes_written(&self) -> usize {
@@ -87,6 +93,13 @@ impl<T: Write> BinaryWriter<T> {
         }
         Ok(())
     }
+
+    pub fn finish(&mut self) {
+        println!("Writing remaining bits...");
+
+        self.writer.write_all(&self.bit_buf.as_slice()[0..=self.bit_buf.len() / 8]).unwrap();
+        self.writer.flush().unwrap();
+    }
 }
 
 impl<T: Read> BinaryReader<T> {
@@ -97,16 +110,17 @@ impl<T: Read> BinaryReader<T> {
         }
     }
 
-    pub fn read_buf(&mut self) -> io::Result<()> {
+    /// Reads from reader MAX_READER_BITCAP / 8 bytes
+    /// Overwrites the buffer! so make sure to save data you need to yous later
+    fn read_buf(&mut self) -> io::Result<()> {
         // allocate new space
         self.bit_buf.resize(MAX_READER_BITCAP, false);
         //println!("BinaryReader::read_buf()");
-
         let read_bytes = self.reader.read(self.bit_buf.as_mut_slice())?;
         assert!(read_bytes * 8 <= self.bit_buf.len());
         
         self.bit_buf.resize(read_bytes * 8, false);
-        //println!("{}", read_bytes);
+        //println!("c:{} | {}", read_bytes, self.bit_buf);
         if read_bytes == 0 {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Reached end"));
         }
@@ -126,13 +140,26 @@ impl<T: Read> BinaryReader<T> {
     }
 
     pub fn read_byte(&mut self) -> io::Result<u8> {
+
+        let mut res = self.bit_buf.as_slice()[0];
+
         if self.bit_buf.len() < 8 {
+            let old_bits = self.bit_buf.len();
+            res &= 0xff << (8 - old_bits);
+            println!("{:b} keep {} bits", res, old_bits);
             self.read_buf()?;
+
+            // copy
+            let new_res = self.bit_buf.as_slice()[0];
+            res |= new_res >> old_bits;
+            println!("{:b}", res);
+
+            self.bit_buf.drain(0..(8 - old_bits));
+
             if self.bit_buf.len() < 8 {
                 return Err(io::Error::new(io::ErrorKind::Other, "Not enough bits read."));
             }
         }
-        let res = self.bit_buf.as_slice()[0];
 
         // copy from bit 8 to bitbuf
         self.bit_buf = self.bit_buf.split_off(8);
@@ -141,27 +168,27 @@ impl<T: Read> BinaryReader<T> {
     }
 }
 
-impl<T: Write> Drop for BinaryWriter<T> {
-    fn drop(&mut self) {
-        println!("Writing remaining bits...");
-
-        self.write_buf().unwrap();
-        self.writer.flush().unwrap();
-    }
-}
 
 #[test]
 fn binary_io_test() -> Result<(), io::Error> {
+    //use std::fs::File;
+    //let mut f =  File::create("bin_test.bin")?;
     let mut storage: Vec<u8> = vec![0; 512];
     {
         let mut writer: BinaryWriter<&mut [u8]> =
             BinaryWriter::new(storage.as_mut_slice());
-        //writer.write_bit(true)?;
+        //let mut writer: BinaryWriter<File> =
+        //    BinaryWriter::new(f);
+        writer.write_bit(true)?;
         for i in 1..10 {
             writer.write_byte(i)?;
             //writer.write_bit(i % 2 == 0)?;
             println!("{} {}", i, i % 2 == 0);
+            println!("{} {:b}", writer.bit_buf, i);
         }
+
+        writer.finish();
+        //f = writer.inner();
     }
 
     //          1|0000000  1|0|000000  10|1|00000  011|0|0000  0100
@@ -169,9 +196,10 @@ fn binary_io_test() -> Result<(), io::Error> {
     // content: true 1 false 2 true 3 false 4 true 5 false 6 true 7 false 8 true 9 false
     println!("{:?}", &storage[0..20]);
     {
-        let mut reader: BinaryReader<&[u8]> = BinaryReader::new(storage.as_slice());
+        //let mut reader: BinaryReader<File> = BinaryReader::new(f);
+        let mut reader: BinaryReader<&[u8]> = BinaryReader::new(&storage);
 
-        //assert_eq!(reader.read_bit()?, true);
+        assert_eq!(reader.read_bit()?, true);
 
         println!("reading loop");
         for i in 1..10 {
