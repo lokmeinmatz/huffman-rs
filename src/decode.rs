@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 /// branch: 0
 /// leaf:   1
-fn construct_tree(reader: &mut BinaryReader) -> io::Result<Node> {
+fn construct_tree(reader: &mut BinaryReader<File>) -> io::Result<Node> {
     let is_leaf = reader.read_bit()?;
     //dbg!(&is_leaf);
     if is_leaf {
@@ -21,7 +21,7 @@ fn construct_tree(reader: &mut BinaryReader) -> io::Result<Node> {
     }
 }
 
-fn traverse_tree(reader: &mut BinaryReader, node: &Node) -> io::Result<u8> {
+fn traverse_tree(reader: &mut BinaryReader<File>, node: &Node) -> io::Result<u8> {
     match node {
         Node::Branch(_, l, r) => {
             let go_right = reader.read_bit()?;
@@ -52,6 +52,7 @@ pub fn decode(path: PathBuf) -> io::Result<()> {
         ));
     }
 
+
     let mut reader = BinaryReader::new(file);
 
     let root: Node = construct_tree(&mut reader)?;
@@ -80,8 +81,13 @@ pub fn decode(path: PathBuf) -> io::Result<()> {
 
     println!("Creating file @ {:?}", path_new);
     let mut writer = BufWriter::new(File::create(path_new)?);
-
+    let mut bytes_written = 0;
     while let Ok(val) = traverse_tree(&mut reader, &root) {
+        bytes_written += 1;
+
+        if bytes_written % 10_000 == 0 {
+            println!("kb written: {}", bytes_written / 1000);
+        }
         if val == 0x1c {
             break;
         }

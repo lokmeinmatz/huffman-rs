@@ -1,31 +1,26 @@
-use std::fs::File;
-use std::io::{self, BufReader, Read, Write};
 use bitvec::prelude::*;
+use std::io::{self, Read, Write};
 
-const MAX_WRITER_BITCAP : usize = 512 * 8;
+const MAX_WRITER_BITCAP: usize = 512 * 8;
+const MAX_READER_BITCAP: usize = 128;
 
-pub struct BinaryWriter<T : Write> {
+pub struct BinaryWriter<T: Write> {
     pub writer: T,
     bit_buf: BitVec<BigEndian, u8>,
-    bytes_written: usize
+    bytes_written: usize,
 }
 
-pub struct BinaryReader {
-    buf_reader: BufReader<File>,
-    bit_buf: usize,
-    bits_read: u8,
+pub struct BinaryReader<T: Read> {
+    reader: T,
+    bit_buf: BitVec<BigEndian, u8>
 }
 
-const MAX_BIT_BUF_BYTES: usize = std::mem::size_of::<usize>();
-const HIGH_DEBUG: bool = false;
-
-impl<T : Write> BinaryWriter<T> {
+impl<T: Write> BinaryWriter<T> {
     pub fn new(w: T) -> Self {
-        dbg!(MAX_BIT_BUF_BYTES);
         BinaryWriter {
             writer: w,
             bit_buf: BitVec::with_capacity(MAX_WRITER_BITCAP),
-            bytes_written: 0
+            bytes_written: 0,
         }
     }
 
@@ -37,7 +32,9 @@ impl<T : Write> BinaryWriter<T> {
         // write bytes that are "ready", copy last "not ready" byte to new bit_buf
 
         let bytes_ready = self.bit_buf.len() / 8;
-        if bytes_ready == 0 {return Ok(())}
+        if bytes_ready == 0 {
+            return Ok(());
+        }
 
         // check if last byte is ready
         let bits_rem = self.bit_buf.len() - (bytes_ready * 8);
@@ -46,8 +43,7 @@ impl<T : Write> BinaryWriter<T> {
             // can write all
             self.writer.write_all(&slice)?;
             self.bit_buf.clear();
-        }
-        else {
+        } else {
             // need to save last byte
             let slice = self.bit_buf.as_slice();
             self.writer.write_all(&slice[..(slice.len() - 1)])?;
@@ -55,7 +51,7 @@ impl<T : Write> BinaryWriter<T> {
             self.bit_buf.truncate(bits_rem);
             self.bit_buf.reserve(MAX_WRITER_BITCAP - 1);
         }
-
+        self.writer.flush()?;
         self.bytes_written += bytes_ready;
 
         Ok(())
@@ -75,7 +71,6 @@ impl<T : Write> BinaryWriter<T> {
 
     pub fn write_byte(&mut self, b: u8) -> io::Result<()> {
         self.bit_buf.extend(b.as_bitslice::<BigEndian>());
-
         if self.bit_buf.len() > MAX_WRITER_BITCAP {
             self.write_buf()?;
         }
@@ -83,7 +78,6 @@ impl<T : Write> BinaryWriter<T> {
     }
 
     pub fn write_path(&mut self, path: &BitSlice) -> io::Result<()> {
-
         // TODO instead of bitwise writing, write as much bytes as possible directly
         // and only store the remaining bits in an buffer?
         self.bit_buf.extend(path);
@@ -95,85 +89,61 @@ impl<T : Write> BinaryWriter<T> {
     }
 }
 
-impl BinaryReader {
-    pub fn new(f: File) -> Self {
+impl<T: Read> BinaryReader<T> {
+    pub fn new(r: T) -> Self {
         BinaryReader {
-            buf_reader: BufReader::new(f),
-            bit_buf: 0,
-            bits_read: MAX_BIT_BUF_BYTES as u8 * 8, // force read_buf when first read
+            reader: r,
+            bit_buf: BitVec::new()
         }
     }
 
     pub fn read_buf(&mut self) -> io::Result<()> {
-        let mut tbuf = [0u8; MAX_BIT_BUF_BYTES];
+        // allocate new space
+        self.bit_buf.resize(MAX_READER_BITCAP, false);
+        //println!("BinaryReader::read_buf()");
 
-        let read_bytes = self.buf_reader.read(&mut tbuf)?;
-
+        let read_bytes = self.reader.read(self.bit_buf.as_mut_slice())?;
+        assert!(read_bytes * 8 <= self.bit_buf.len());
+        
+        self.bit_buf.resize(read_bytes * 8, false);
         //println!("{}", read_bytes);
         if read_bytes == 0 {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Reached end"));
         }
 
-        //TODO: read less than sizeof<usize> bytes
-        //println!("{:?}", tbuf);
-        let val = usize::from_be_bytes(tbuf);
-
-        if cfg!(debug_assertions) && HIGH_DEBUG {
-            println!("read buf {:#066b}", val);
-        }
-
-        self.bit_buf = val;
-        self.bits_read = 0;
-
         Ok(())
     }
 
     pub fn read_bit(&mut self) -> io::Result<bool> {
-        if self.bits_read >= MAX_BIT_BUF_BYTES as u8 * 8 {
+        if self.bit_buf.len() == 0 {
             self.read_buf()?;
+            if self.bit_buf.len() == 0 {
+                // no more bits
+                return Err(io::Error::new(io::ErrorKind::Other, "No more bits can be read."));
+            }
         }
-        let res = Ok((self.bit_buf >> (MAX_BIT_BUF_BYTES * 8 - 1)) != 0);
-
-        self.bit_buf <<= 1;
-        self.bits_read += 1;
-        res
+        Ok(self.bit_buf.remove(0))
     }
 
     pub fn read_byte(&mut self) -> io::Result<u8> {
-        if self.bits_read >= MAX_BIT_BUF_BYTES as u8 * 8 {
+        if self.bit_buf.len() < 8 {
             self.read_buf()?;
+            if self.bit_buf.len() < 8 {
+                return Err(io::Error::new(io::ErrorKind::Other, "Not enough bits read."));
+            }
         }
-        if self.bits_read <= MAX_BIT_BUF_BYTES as u8 * 8 - 8 {
-            let res = Ok((self.bit_buf >> (MAX_BIT_BUF_BYTES * 8 - 8)) as u8);
-            //println!("{:#034b}", self.bit_buf);
-            self.bits_read += 8;
-            self.bit_buf <<= 8;
+        let res = self.bit_buf.as_slice()[0];
 
-            res
+        // copy from bit 8 to bitbuf
+        self.bit_buf = self.bit_buf.split_off(8);
 
-        } else {
-            // problem: part of this byte is stored in next chunk
-            let remaining = 8 - (MAX_BIT_BUF_BYTES as u8 * 8 - self.bits_read);
-
-            assert!(remaining <= 8);
-
-            let mut res = (self.bit_buf >> (MAX_BIT_BUF_BYTES * 8 - 8)) as u8; // stores the high bits at the right place;
-            self.read_buf()?;
-
-            res |= (self.bit_buf >> (MAX_BIT_BUF_BYTES as u8 * 8 - remaining)) as u8;
-
-            self.bit_buf <<= remaining;
-            self.bits_read += remaining;
-
-            Ok(res)
-        }
+        Ok(res)
     }
 }
 
-impl<T : Write> Drop for BinaryWriter<T> {
+impl<T: Write> Drop for BinaryWriter<T> {
     fn drop(&mut self) {
         println!("Writing remaining bits...");
-        
 
         self.write_buf().unwrap();
         self.writer.flush().unwrap();
@@ -182,12 +152,14 @@ impl<T : Write> Drop for BinaryWriter<T> {
 
 #[test]
 fn binary_io_test() -> Result<(), io::Error> {
+    let mut storage: Vec<u8> = vec![0; 512];
     {
-        let mut writer: BinaryWriter<std::fs::File> = BinaryWriter::new(std::fs::File::create("./test.bin")?);
-        writer.write_bit(true)?;
+        let mut writer: BinaryWriter<&mut [u8]> =
+            BinaryWriter::new(storage.as_mut_slice());
+        //writer.write_bit(true)?;
         for i in 1..10 {
             writer.write_byte(i)?;
-            writer.write_bit(i % 2 == 0)?;
+            //writer.write_bit(i % 2 == 0)?;
             println!("{} {}", i, i % 2 == 0);
         }
     }
@@ -195,16 +167,17 @@ fn binary_io_test() -> Result<(), io::Error> {
     //          1|0000000  1|0|000000  10|1|00000  011|0|0000  0100
     //
     // content: true 1 false 2 true 3 false 4 true 5 false 6 true 7 false 8 true 9 false
-
+    println!("{:?}", &storage[0..20]);
     {
-        let mut reader: BinaryReader = BinaryReader::new(std::fs::File::open("./test.bin")?);
+        let mut reader: BinaryReader<&[u8]> = BinaryReader::new(storage.as_slice());
 
-        assert_eq!(reader.read_bit()?, true);
+        //assert_eq!(reader.read_bit()?, true);
 
         println!("reading loop");
         for i in 1..10 {
+            println!("loop {}", i);
             assert_eq!(reader.read_byte()?, i);
-            assert_eq!(reader.read_bit()?, i % 2 == 0);
+            //assert_eq!(reader.read_bit()?, i % 2 == 0);
         }
     }
 
