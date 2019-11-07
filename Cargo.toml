@@ -6,3 +6,4 @@ edition = "2018"
 
 [dependencies]
 bitvec = "0.15"
+linked-list = "0.0.3"

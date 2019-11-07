@@ -2,7 +2,7 @@ use bitvec::prelude::*;
 use std::io::{self, Read, Write};
 
 
-const MAX_WRITER_BITCAP: usize = 512 * 8;
+const MAX_WRITER_BITCAP: usize = 128 * 128;
 const MAX_READER_BITCAP: usize = 128;
 
 pub struct BinaryWriter<T: Write> {
@@ -97,7 +97,7 @@ impl<T: Write> BinaryWriter<T> {
     pub fn finish(&mut self) {
         println!("Writing remaining bits...");
 
-        self.writer.write_all(&self.bit_buf.as_slice()[0..=self.bit_buf.len() / 8]).unwrap();
+        self.writer.write_all(&self.bit_buf.as_slice()[0..self.bit_buf.len() / 8]).unwrap();
         self.writer.flush().unwrap();
     }
 }
@@ -110,7 +110,7 @@ impl<T: Read> BinaryReader<T> {
         }
     }
 
-    /// Reads from reader MAX_READER_BITCAP / 8 bytes
+    /// Reads from reader MAX_READER_BITCAP / 8 bytes. 
     /// Overwrites the buffer! so make sure to save data you need to yous later
     fn read_buf(&mut self) -> io::Result<()> {
         // allocate new space
@@ -140,9 +140,10 @@ impl<T: Read> BinaryReader<T> {
     }
 
     pub fn read_byte(&mut self) -> io::Result<u8> {
-
+        if self.bit_buf.is_empty() {
+            self.read_buf()?;
+        }
         let mut res = self.bit_buf.as_slice()[0];
-
         if self.bit_buf.len() < 8 {
             let old_bits = self.bit_buf.len();
             res &= 0xff << (8 - old_bits);
@@ -152,13 +153,14 @@ impl<T: Read> BinaryReader<T> {
             // copy
             let new_res = self.bit_buf.as_slice()[0];
             res |= new_res >> old_bits;
-            println!("{:b}", res);
+            println!("new_res: {:b} res: {:b}", new_res, res);
 
             self.bit_buf.drain(0..(8 - old_bits));
 
             if self.bit_buf.len() < 8 {
                 return Err(io::Error::new(io::ErrorKind::Other, "Not enough bits read."));
             }
+            return Ok(res);
         }
 
         // copy from bit 8 to bitbuf
@@ -171,20 +173,19 @@ impl<T: Read> BinaryReader<T> {
 
 #[test]
 fn binary_io_test() -> Result<(), io::Error> {
-    //use std::fs::File;
-    //let mut f =  File::create("bin_test.bin")?;
-    let mut storage: Vec<u8> = vec![0; 512];
+    use std::fs::File;
+    //let mut storage: Vec<u8> = vec![0; 512];
     {
-        let mut writer: BinaryWriter<&mut [u8]> =
-            BinaryWriter::new(storage.as_mut_slice());
-        //let mut writer: BinaryWriter<File> =
-        //    BinaryWriter::new(f);
+        //let mut writer: BinaryWriter<&mut [u8]> =
+        //    BinaryWriter::new(storage.as_mut_slice());
+        let mut writer: BinaryWriter<File> =
+            BinaryWriter::new(File::create("bin_test.bin")?);
         writer.write_bit(true)?;
-        for i in 1..10 {
-            writer.write_byte(i)?;
-            //writer.write_bit(i % 2 == 0)?;
-            println!("{} {}", i, i % 2 == 0);
-            println!("{} {:b}", writer.bit_buf, i);
+        for i in 1..1000 {
+            writer.write_byte((i % 256)  as u8)?;
+            writer.write_bit(i % 2 == 0)?;
+            //println!("{} {}", i, i % 2 == 0);
+            //println!("{} {:b}", writer.bit_buf, i);
         }
 
         writer.finish();
@@ -194,18 +195,19 @@ fn binary_io_test() -> Result<(), io::Error> {
     //          1|0000000  1|0|000000  10|1|00000  011|0|0000  0100
     //
     // content: true 1 false 2 true 3 false 4 true 5 false 6 true 7 false 8 true 9 false
-    println!("{:?}", &storage[0..20]);
+
+    //println!("{:?}", &storage[0..20]);
     {
-        //let mut reader: BinaryReader<File> = BinaryReader::new(f);
-        let mut reader: BinaryReader<&[u8]> = BinaryReader::new(&storage);
+        //let mut reader: BinaryReader<&[u8]> = BinaryReader::new(&storage);
+        let mut reader: BinaryReader<File> = BinaryReader::new(File::open("bin_test.bin")?);
 
         assert_eq!(reader.read_bit()?, true);
 
         println!("reading loop");
-        for i in 1..10 {
+        for i in 1..1000 {
             println!("loop {}", i);
-            assert_eq!(reader.read_byte()?, i);
-            //assert_eq!(reader.read_bit()?, i % 2 == 0);
+            assert_eq!(reader.read_byte()?, (i % 256) as u8);
+            assert_eq!(reader.read_bit()?, i % 2 == 0);
         }
     }
 

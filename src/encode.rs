@@ -11,6 +11,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
+use linked_list::{LinkedList};
 
 fn add_to_lookup(lookup: &mut HashMap<u8, BitVec>, parent_path: BitVec, node: &Node) {
     match node {
@@ -241,7 +242,7 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
 
                         //println!("[w{}] sends {} bits", t_id, compressed.len());
                         // send data to writer thread
-                        postdata_waiting.fetch_add(1, Ordering::Relaxed);
+                        postdata_waiting.fetch_add(1, Ordering::Acquire);
                         post_sender
                             .send(PostData {
                                 id: data.id,
@@ -258,7 +259,7 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
                             total_time_working / bytes_processed
                         );
                     }
-                    workers_active.fetch_sub(1, Ordering::Relaxed);
+                    workers_active.fetch_sub(1, Ordering::Acquire);
                 })
                 .unwrap(),
         );
@@ -272,54 +273,50 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
         .spawn(move || {
             println!("Writer-thread running");
 
-            let mut buf: Vec<PostData> = Vec::new();
+            let mut buf: LinkedList<PostData> = LinkedList::new();
             let mut next_expected: usize = 0;
 
             while workers_active.load(Ordering::Relaxed) > 0
-                || postdata_waiting.load(Ordering::Relaxed) > 0
+                || postdata_waiting.load(Ordering::SeqCst) > 0
             {
                 let p_dat = post_receiver.recv().unwrap();
-                postdata_waiting.fetch_sub(1, Ordering::Relaxed);
+                postdata_waiting.fetch_sub(1, Ordering::Acquire);
                 //println!("writer received {} bits", p_dat.content.len());
                 // case 1: p_dat ist next expected package
                 if p_dat.id == next_expected {
                     writer.write_path(&p_dat.content).unwrap();
                     next_expected += 1;
 
-                    let mut n_idx = 0;
 
-                    while n_idx < buf.len() && buf[n_idx].id == next_expected {
-                        writer.write_path(&p_dat.content).unwrap();
+                    while let Some(next) = buf.front() {
+                        if next.id != next_expected { break; }
+                        writer.write_path(&next.content).unwrap();
                         next_expected += 1;
-                        n_idx += 1;
+                        buf.pop_front();
                     }
 
-                    if n_idx > 0 {
-                        buf.drain(0..n_idx);
-                    }
                 }
                 // case 2: p_dat is somewhere in buf
-                else if !buf.is_empty() && p_dat.id < buf.last().unwrap().id {
+                else if !buf.is_empty() && p_dat.id < buf.back().unwrap().id {
                     // find where to insert
-                    let mut pos = 0;
-                    while pos < buf.len() {
-                        if buf[pos].id > p_dat.id {
-                            break;
-                        }
-                        pos += 1;
+                    let mut csr = buf.cursor();
+                    while let Some(n) = csr.next() {
+                        if n.id > p_dat.id { break; }
                     }
 
-                    buf.insert(pos, p_dat);
+                    csr.prev(); // now add new node in
+                    csr.insert(p_dat);
+
                 }
                 // case 3: p_dat is at the end
                 else {
-                    buf.push(p_dat);
+                    buf.push_back(p_dat);
                 }
             }
 
             if !buf.is_empty() {
                 eprintln!("Still got {} unproccessed packages", buf.len());
-                eprintln!("First unprocessed id: {}", buf[0].id);
+                eprintln!("First unprocessed id: {}", buf.front().unwrap().id);
                 panic!("Not all packets processed");
             }
 

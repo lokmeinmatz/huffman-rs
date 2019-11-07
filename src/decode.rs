@@ -1,12 +1,12 @@
 use crate::binary_io::BinaryReader;
 use crate::{Node, HEADER};
 use std::fs::File;
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufWriter, BufReader, Read, Write};
 use std::path::PathBuf;
 
 /// branch: 0
 /// leaf:   1
-fn construct_tree(reader: &mut BinaryReader<File>) -> io::Result<Node> {
+fn construct_tree<T: Read>(reader: &mut BinaryReader<T>) -> io::Result<Node> {
     let is_leaf = reader.read_bit()?;
     //dbg!(&is_leaf);
     if is_leaf {
@@ -21,7 +21,7 @@ fn construct_tree(reader: &mut BinaryReader<File>) -> io::Result<Node> {
     }
 }
 
-fn traverse_tree(reader: &mut BinaryReader<File>, node: &Node) -> io::Result<u8> {
+fn traverse_tree<T: Read>(reader: &mut BinaryReader<T>, node: &Node) -> io::Result<u8> {
     match node {
         Node::Branch(_, l, r) => {
             let go_right = reader.read_bit()?;
@@ -53,7 +53,7 @@ pub fn decode(path: PathBuf) -> io::Result<()> {
     }
 
 
-    let mut reader = BinaryReader::new(file);
+    let mut reader = BinaryReader::new(BufReader::new(file));
 
     let root: Node = construct_tree(&mut reader)?;
     let mut path_new = path.clone();
@@ -91,7 +91,7 @@ pub fn decode(path: PathBuf) -> io::Result<()> {
         if val == 0x1c {
             break;
         }
-        writer.write_all(&[val])?;
+        writer.write(&[val])?;
     }
 
     Ok(())
