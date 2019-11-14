@@ -327,7 +327,7 @@ pub fn encode(path: PathBuf) -> io::Result<()> {
                     panic!("FileSeperator Byte not in lookup-table");
                 }
             }
-
+            writer.finish();
             stats.written_bytes = writer.get_bytes_written();
 
             println!(

@@ -25,11 +25,6 @@ impl<T: Write> BinaryWriter<T> {
         }
     }
 
-    pub fn inner(mut self) -> T {
-        self.finish();
-        self.writer
-    }
-
     pub fn get_bytes_written(&self) -> usize {
         self.bytes_written
     }

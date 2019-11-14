@@ -91,7 +91,7 @@ pub fn decode(path: PathBuf) -> io::Result<()> {
         if val == 0x1c {
             break;
         }
-        writer.write(&[val])?;
+        writer.write_all(&[val])?;
     }
 
     Ok(())

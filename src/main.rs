@@ -1,5 +1,4 @@
 #![feature(box_syntax)]
-#![feature(let_chains)]
 
 use std::env;
 use std::io::{self};
